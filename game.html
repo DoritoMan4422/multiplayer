@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>multiplayer test</title>
+    <!-- PeerJS from CDN for WebRTC Signaling -->
+    <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+    <style>
+        body { font-family: monospace; background: #1a1a1a; color: #ddd; margin: 20px; }
+        .panel { background: #2a2a2a; padding: 15px; margin-bottom: 10px; border-radius: 5px; }
+        input, button { background: #333; color: #fff; border: 1px solid #555; padding: 8px; margin-right: 5px; font-family: monospace;}
+        button:hover { background: #444; cursor: pointer; }
+        canvas { background: #111; border: 2px solid #444; display: block; margin-bottom: 10px; }
+        #log { width: 100%; height: 150px; background: #000; color: #0f0; border: none; padding: 10px; box-sizing: border-box; overflow-y: scroll; font-size: 12px;}
+        .flex { display: flex; gap: 20px; }
+    </style>
+</head>
+<body>
+
+<div class="panel">
+    <h2>deterministic lockstep webrtc multiplayer test</h2>
+    <div id="setup-ui">
+        <input type="text" id="roomCode" placeholder="Enter Room Code" value="test-room-123">
+        <button id="btnHost">Create as Host</button>
+        <button id="btnJoin">Join Room</button>
+    </div>
+    <div id="lobby-ui" style="display: none;">
+        <span id="lobbyStatus">Waiting for players...</span>
+        <span id="playerCount">Players: 1</span>
+        <button id="btnStart" style="display: none;">Start Game</button>
+    </div>
+    <div id="game-ui" style="display: none;">
+        Status: <span id="syncStatus" style="color: #0f0;">Syncing...</span> | 
+        Current Tick: <span id="tickDisplay">0</span>
+    </div>
+</div>
+
+<div class="flex">
+    <canvas id="gameCanvas" width="500" height="400"></canvas>
+    <div style="flex-grow: 1;">
+        <textarea id="log" readonly></textarea>
+    </div>
+</div>
+
+<script>
+const TICK_RATE = 60;
+const MS_PER_TICK = 1000 / TICK_RATE;
+const INPUT_BUFFER = 8; // Ticks ahead we generate inputs; must cover RTT/2
+const RESYNC_INTERVAL = 120; // Check sync every 120 ticks (2 seconds)
+
+let appState = 'SETUP'; // SETUP, LOBBY, PLAYING
+let isHost = false;
+let myId = '';
+let expectedPlayers = []; // List of all player IDs
+
+// Network
+let peer = null;
+let connections = {}; // Map of PeerJS DataConnections
+
+// Simulation State
+let simState = { players: {} };
+let inputBuffer = {}; // inputBuffer[tick][playerId] = inputData
+let currentTick = 0;   // The tick currently being simulated
+let nextInputTick = 0; // The future tick we are generating local input for
+
+// Sync & History
+let hashHistory = {};  // hashHistory[tick] = hash
+let stateHistory = {}; // stateHistory[tick] = state clone
+
+// Timing
+let lastTime = 0;
+let accumulator = 0;
+
+// Local Input Tracker
+const localInput = { up: false, down: false, left: false, right: false, action: false, angle: 0 };
+
+function logMsg(msg) {
+    const logBox = document.getElementById('log');
+    logBox.value += `[${new Date().toLocaleTimeString()}] ${msg}\n`;
+    logBox.scrollTop = logBox.scrollHeight;
+}
+
+function computeHash(state) {
+    // Simple deterministic string hash for resync detection
+    const str = JSON.stringify(state);
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) {
+        hash = ((hash << 5) - hash) + str.charCodeAt(i);
+        hash |= 0; 
+    }
+    return hash;
+}
+
+// Clean up old memory to prevent leaks
+function pruneHistory(tick) {
+    const pruneTick = tick - 300; // Keep last 5 seconds
+    if (inputBuffer[pruneTick]) delete inputBuffer[pruneTick];
+    if (hashHistory[pruneTick]) delete hashHistory[pruneTick];
+    if (stateHistory[pruneTick]) delete stateHistory[pruneTick];
+}
+
+function initHost() {
+    const code = document.getElementById('roomCode').value;
+    myId = `host-${code}`;
+    isHost = true;
+    
+    peer = new Peer(myId);
+    setupPeerEvents();
+
+    peer.on('connection', (conn) => {
+        conn.on('open', () => {
+            logMsg(`Player connected: ${conn.peer}`);
+            connections[conn.peer] = conn;
+            
+            if (!expectedPlayers.includes(conn.peer)) {
+                expectedPlayers.push(conn.peer);
+            }
+            updateLobbyUI();
+
+            // Notify new player of everyone currently in room
+            conn.send({ type: 'lobby_update', players: expectedPlayers });
+            // Notify others
+            broadcast({ type: 'lobby_update', players: expectedPlayers }, conn.peer);
+        });
+
+        conn.on('data', (data) => handleNetworkMessage(data, conn.peer));
+        conn.on('close', () => handleDisconnect(conn.peer));
+    });
+}
+
+function initClient() {
+    const code = document.getElementById('roomCode').value;
+    const hostId = `host-${code}`;
+    myId = `client-${Math.random().toString(36).substr(2, 6)}`;
+    isHost = false;
+    
+    peer = new Peer(myId);
+    setupPeerEvents();
+
+    peer.on('open', () => {
+        logMsg(`Connecting to host: ${hostId}...`);
+        const conn = peer.connect(hostId, { reliable: true });
+
+        conn.on('open', () => {
+            logMsg('Connected to host!');
+            connections[hostId] = conn;
+        });
+
+        conn.on('data', (data) => handleNetworkMessage(data, hostId));
+        conn.on('close', () => handleDisconnect(hostId));
+    });
+}
+
+function setupPeerEvents() {
+    peer.on('open', (id) => {
+        logMsg(`My Peer ID: ${id}`);
+        expectedPlayers = [myId];
+        
+        document.getElementById('setup-ui').style.display = 'none';
+        document.getElementById('lobby-ui').style.display = 'block';
+        if (isHost) document.getElementById('btnStart').style.display = 'inline-block';
+        updateLobbyUI();
+    });
+    peer.on('error', (err) => logMsg(`Peer error: ${err.type}`));
+}
+
+function broadcast(msg, excludeId = null) {
+    for (let id in connections) {
+        if (id !== excludeId && connections[id]) {
+            try { connections[id].send(msg); } catch(e) {}
+        }
+    }
+}
+
+function sendToHost(msg) {
+    const hostId = Object.keys(connections)[0];
+    if (connections[hostId]) {
+        try { connections[hostId].send(msg); } catch(e) {}
+    }
+}
+
+function handleNetworkMessage(msg, senderId) {
+    switch(msg.type) {
+        case 'lobby_update':
+            expectedPlayers = msg.players;
+            updateLobbyUI();
+            break;
+
+        case 'start_game':
+            startGame();
+            break;
+
+        case 'input':
+            // Store received input
+            if (!inputBuffer[msg.tick]) inputBuffer[msg.tick] = {};
+            inputBuffer[msg.tick][msg.playerId] = msg.input;
+
+            // If Host, relay input to everyone else
+            if (isHost) {
+                broadcast(msg, senderId); 
+            }
+            break;
+
+        case 'sync_check': // Received by Host from Client
+            if (!isHost) return;
+            const hostHash = hashHistory[msg.tick];
+            if (hostHash !== undefined && hostHash !== msg.hash) {
+                logMsg(`DESYNC DETECTED with ${senderId} at tick ${msg.tick}!`);
+                connections[senderId].send({
+                    type: 'force_sync',
+                    tick: msg.tick,
+                    state: stateHistory[msg.tick]
+                });
+            }
+            break;
+
+        case 'force_sync': // Received by Client from Host
+            logMsg(`>>> SNAPSHOT RECEIVED: Overwriting state to tick ${msg.tick}`);
+            simState = JSON.parse(JSON.stringify(msg.state));
+            
+            // Fast-forward (Replay) from the sync point back up to currentTick
+            for (let t = msg.tick + 1; t < currentTick; t++) {
+                if (hasAllInputsFor(t)) {
+                    runPhysics(t, simState);
+                }
+            }
+            break;
+    }
+}
+
+function handleDisconnect(id) {
+    logMsg(`Player disconnected: ${id}`);
+    delete connections[id];
+    expectedPlayers = expectedPlayers.filter(p => p !== id);
+    updateLobbyUI();
+}
+
+window.addEventListener('keydown', (e) => {
+    if (e.code === 'ArrowUp' || e.code === 'KeyW') localInput.up = true;
+    if (e.code === 'ArrowDown' || e.code === 'KeyS') localInput.down = true;
+    if (e.code === 'ArrowLeft' || e.code === 'KeyA') localInput.left = true;
+    if (e.code === 'ArrowRight' || e.code === 'KeyD') localInput.right = true;
+});
+
+window.addEventListener('keyup', (e) => {
+    if (e.code === 'ArrowUp' || e.code === 'KeyW') localInput.up = false;
+    if (e.code === 'ArrowDown' || e.code === 'KeyS') localInput.down = false;
+    if (e.code === 'ArrowLeft' || e.code === 'KeyA') localInput.left = false;
+    if (e.code === 'ArrowRight' || e.code === 'KeyD') localInput.right = false;
+});
+
+function hasAllInputsFor(tick) {
+    if (!inputBuffer[tick]) return false;
+    for (let id of expectedPlayers) {
+        if (!inputBuffer[tick][id]) return false;
+    }
+    return true;
+}
+
+function generateAndSendInput(tick) {
+    const myInputData = { ...localInput }; 
+    if (!inputBuffer[tick]) inputBuffer[tick] = {};
+    inputBuffer[tick][myId] = myInputData;
+
+    const msg = { type: 'input', tick: tick, playerId: myId, input: myInputData };
+    if (isHost) broadcast(msg); else sendToHost(msg);
+}
+
+function startGame() {
+    appState = 'PLAYING';
+    document.getElementById('lobby-ui').style.display = 'none';
+    document.getElementById('game-ui').style.display = 'block';
+
+    expectedPlayers.sort();
+    expectedPlayers.forEach((id, index) => {
+        simState.players[id] = {
+            x: 50 + (index * 100), 
+            y: 50, 
+            vx: 0, 
+            vy: 0,
+            color: `hsl(${index * 137.5}, 70%, 50%)`
+        };
+    });
+
+    currentTick = 0;
+    nextInputTick = 0; 
+    
+    for (let i = 0; i < INPUT_BUFFER; i++) {
+        generateAndSendInput(nextInputTick);
+        nextInputTick++;
+    }
+    
+    lastTime = performance.now();
+    requestAnimationFrame(gameLoop);
+}
+
+function gameLoop(time) {
+    requestAnimationFrame(gameLoop);
+    if (appState !== 'PLAYING') return;
+
+    let dt = time - lastTime;
+    if (dt > 250) dt = MS_PER_TICK; // clamp after tab switch
+    accumulator += dt;
+    lastTime = time;
+
+    // 1. Advance simulation at real-time rate (1 tick per MS_PER_TICK), gated by inputs.
+    //    We deliberately do now try to catch up faster than 1 tick/frame.
+    //    Doing so caused an oscillating burst-catchup: when a stall clears, one player
+    //    would race through 50+ ticks instantly, overshoot the other player's input buffer,
+    //    and immediately cause the other player to stall. They'd keep trading.
+    const ticksBefore = currentTick;
+    while (accumulator >= MS_PER_TICK) {
+        if (!hasAllInputsFor(currentTick)) break; // stall: wait for remote inputs
+        accumulator -= MS_PER_TICK;
+        simulateTick(currentTick);
+        currentTick++;
+        pruneHistory(currentTick);
+    }
+
+    // If stalling, drain the accumulator so we don't burst when inputs arrive.
+    if (!hasAllInputsFor(currentTick)) {
+        accumulator = Math.min(accumulator, MS_PER_TICK - 1);
+    }
+
+    // 2. Always maintain exactly INPUT_BUFFER input ticks ahead of currentTick.
+    //    This runs even while stalling, so the remote player is never starved.
+    //    The hard cap at currentTick + INPUT_BUFFER is the key fix: it prevents
+    //    building up a huge backlog of future inputs that causes the other player
+    //    to burst-catchup and trigger the alternating stall pattern.
+    while (nextInputTick < currentTick + INPUT_BUFFER) {
+        generateAndSendInput(nextInputTick);
+        nextInputTick++;
+    }
+
+    // 3. UI true stall means we had real-time budget but couldn't advance simulation.
+    const statusEl = document.getElementById('syncStatus');
+    if (currentTick === ticksBefore && !hasAllInputsFor(currentTick)) {
+        statusEl.innerText = "Stalling (Waiting for network...)";
+        statusEl.style.color = "red";
+    } else {
+        statusEl.innerText = "Running perfectly";
+        statusEl.style.color = "#0f0";
+    }
+    document.getElementById('tickDisplay').innerText = currentTick;
+
+    render();
+}
+
+function runPhysics(tick, stateObj) {
+    const inputs = inputBuffer[tick];
+    for (let id of expectedPlayers) {
+        const inp = inputs[id];
+        const p = stateObj.players[id];
+        if (!p) continue;
+
+        let dx = 0, dy = 0;
+        if (inp.up) dy -= 1;
+        if (inp.down) dy += 1;
+        if (inp.left) dx -= 1;
+        if (inp.right) dx += 1;
+
+        p.vx = dx * 4;
+        p.vy = dy * 4;
+        p.x += p.vx;
+        p.y += p.vy;
+
+        if (p.x < 0) p.x = 0;
+        if (p.x > 480) p.x = 480;
+        if (p.y < 0) p.y = 0;
+        if (p.y > 380) p.y = 380;
+    }
+}
+
+function simulateTick(tick) {
+    runPhysics(tick, simState);
+
+    if (tick > 0 && tick % RESYNC_INTERVAL === 0) {
+        const hash = computeHash(simState);
+        hashHistory[tick] = hash;
+        
+        stateHistory[tick] = JSON.parse(JSON.stringify(simState));
+
+        if (!isHost) {
+            sendToHost({ type: 'sync_check', tick: tick, hash: hash });
+        }
+    }
+}
+
+function render() {
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d');
+    
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    for (let id in simState.players) {
+        const p = simState.players[id];
+        ctx.fillStyle = p.color;
+        ctx.fillRect(p.x, p.y, 20, 20);
+
+        if (id === myId) {
+            ctx.strokeStyle = '#fff';
+            ctx.lineWidth = 2;
+            ctx.strokeRect(p.x - 2, p.y - 2, 24, 24);
+        }
+    }
+}
+
+function updateLobbyUI() {
+    document.getElementById('playerCount').innerText = `Players: ${expectedPlayers.length}`;
+}
+
+// Event Listeners
+document.getElementById('btnHost').addEventListener('click', initHost);
+document.getElementById('btnJoin').addEventListener('click', initClient);
+document.getElementById('btnStart').addEventListener('click', () => {
+    if (isHost) {
+        broadcast({ type: 'start_game' });
+        startGame();
+    }
+});
+
+</script>
+</body>
+</html>
