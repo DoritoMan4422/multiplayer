@@ -44,6 +44,33 @@
 </div>
 
 <script>
+// ICE config with STUN + TURN for cross-network/device support.
+// TURN is a relay fallback when direct P2P fails (symmetric NAT, firewalls, etc.)
+// openrelay.metered.ca is a free public TURN server — replace with your own for production.
+const ICE_CONFIG = {
+    config: {
+        iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:stun1.l.google.com:19302' },
+            {
+                urls: 'turn:openrelay.metered.ca:80',
+                username: 'openrelayproject',
+                credential: 'openrelayproject'
+            },
+            {
+                urls: 'turn:openrelay.metered.ca:443',
+                username: 'openrelayproject',
+                credential: 'openrelayproject'
+            },
+            {
+                urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+                username: 'openrelayproject',
+                credential: 'openrelayproject'
+            }
+        ]
+    }
+};
+
 const TICK_RATE = 60;
 const MS_PER_TICK = 1000 / TICK_RATE;
 const INPUT_BUFFER = 8; // Ticks ahead we generate inputs; must cover RTT/2
@@ -105,7 +132,7 @@ function initHost() {
     myId = `host-${code}`;
     isHost = true;
     
-    peer = new Peer(myId);
+    peer = new Peer(myId, ICE_CONFIG);
     setupPeerEvents();
 
     peer.on('connection', (conn) => {
@@ -135,7 +162,7 @@ function initClient() {
     myId = `client-${Math.random().toString(36).substr(2, 6)}`;
     isHost = false;
     
-    peer = new Peer(myId);
+    peer = new Peer(myId, ICE_CONFIG);
     setupPeerEvents();
 
     peer.on('open', () => {
