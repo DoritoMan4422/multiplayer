@@ -49,32 +49,30 @@
 const ICE_CONFIG = {
     config: {
         iceServers: [
-            // STUN servers — used first, free, no credentials needed
-            { urls: 'stun:stun.l.google.com:19302' },
-            { urls: 'stun:stun1.l.google.com:19302' },
-            { urls: 'stun:stun2.l.google.com:19302' },
-            { urls: 'stun:stun3.l.google.com:19302' },
-            { urls: 'stun:stun4.l.google.com:19302' },
-            { urls: 'stun:stun.relay.metered.ca:80' },
-            // TURN relay servers — used as fallback when STUN P2P fails
-            // freestun.net is a reliable free public TURN server
-            {
-                urls: 'turn:freestun.net:3479',
-                username: 'free',
-                credential: 'free'
-            },
-            {
-                urls: 'turns:freestun.net:5350',
-                username: 'free',
-                credential: 'free'
-            },
-            // numb.viagenie.ca as secondary fallback (register free at numb.viagenie.ca)
-            // These are public credentials for testing only
-            {
-                urls: 'turn:numb.viagenie.ca',
-                username: 'webrtc@live.com',
-                credential: 'muazkh'
-            },
+      {
+        urls: "stun:stun.relay.metered.ca:80",
+      },
+      {
+        urls: "turn:ca.relay.metered.ca:80",
+        username: "9289fe99231baf5855b99ecb",
+        credential: "98Nk1wd4rUDIvOxn",
+      },
+      {
+        urls: "turn:ca.relay.metered.ca:80?transport=tcp",
+        username: "9289fe99231baf5855b99ecb",
+        credential: "98Nk1wd4rUDIvOxn",
+      },
+      {
+        urls: "turn:ca.relay.metered.ca:443",
+        username: "9289fe99231baf5855b99ecb",
+        credential: "98Nk1wd4rUDIvOxn",
+      },
+      {
+        urls: "turns:ca.relay.metered.ca:443?transport=tcp",
+        username: "9289fe99231baf5855b99ecb",
+        credential: "98Nk1wd4rUDIvOxn",
+      },
+      
         ],
         // FIX 2: iceCandidatePoolSize speeds up ICE gathering on slow/restricted networks
         iceCandidatePoolSize: 10,
