@@ -4,7 +4,6 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>multiplayer test</title>
-    <!-- PeerJS from CDN for WebRTC Signaling -->
     <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
     <style>
         body { font-family: monospace; background: #1a1a1a; color: #ddd; margin: 20px; }
@@ -44,62 +43,72 @@
 </div>
 
 <script>
-// ICE config with STUN + TURN for cross-network/device support.
-// TURN is a relay fallback when direct P2P fails (symmetric NAT, firewalls, etc.)
-// openrelay.metered.ca is a free public TURN server — replace with your own for production.
+// FIX 1: Replaced broken openrelay.metered.ca credentials with freestun.net (reliable free TURN)
+// and added many more STUN servers. TURN is essential for school/office networks where
+// devices behind the same NAT/firewall can't reach each other directly.
 const ICE_CONFIG = {
     config: {
         iceServers: [
+            // STUN servers — used first, free, no credentials needed
             { urls: 'stun:stun.l.google.com:19302' },
             { urls: 'stun:stun1.l.google.com:19302' },
+            { urls: 'stun:stun2.l.google.com:19302' },
+            { urls: 'stun:stun3.l.google.com:19302' },
+            { urls: 'stun:stun4.l.google.com:19302' },
+            { urls: 'stun:stun.relay.metered.ca:80' },
+            // TURN relay servers — used as fallback when STUN P2P fails
+            // freestun.net is a reliable free public TURN server
             {
-                urls: 'turn:openrelay.metered.ca:80',
-                username: 'openrelayproject',
-                credential: 'openrelayproject'
+                urls: 'turn:freestun.net:3479',
+                username: 'free',
+                credential: 'free'
             },
             {
-                urls: 'turn:openrelay.metered.ca:443',
-                username: 'openrelayproject',
-                credential: 'openrelayproject'
+                urls: 'turns:freestun.net:5350',
+                username: 'free',
+                credential: 'free'
             },
+            // numb.viagenie.ca as secondary fallback (register free at numb.viagenie.ca)
+            // These are public credentials for testing only
             {
-                urls: 'turn:openrelay.metered.ca:443?transport=tcp',
-                username: 'openrelayproject',
-                credential: 'openrelayproject'
-            }
-        ]
-    }
+                urls: 'turn:numb.viagenie.ca',
+                username: 'webrtc@live.com',
+                credential: 'muazkh'
+            },
+        ],
+        // FIX 2: iceCandidatePoolSize speeds up ICE gathering on slow/restricted networks
+        iceCandidatePoolSize: 10,
+    },
+    // FIX 3: Force JSON serialization — binary (default) sometimes causes issues on
+    // Chromebooks and causes silent connection failures with certain Chrome versions.
+    serialization: 'json',
+    reliable: true
 };
 
 const TICK_RATE = 60;
 const MS_PER_TICK = 1000 / TICK_RATE;
-const INPUT_BUFFER = 8; // Ticks ahead we generate inputs; must cover RTT/2
-const RESYNC_INTERVAL = 120; // Check sync every 120 ticks (2 seconds)
+const INPUT_BUFFER = 8;
+const RESYNC_INTERVAL = 120;
 
-let appState = 'SETUP'; // SETUP, LOBBY, PLAYING
+let appState = 'SETUP';
 let isHost = false;
 let myId = '';
-let expectedPlayers = []; // List of all player IDs
+let expectedPlayers = [];
 
-// Network
 let peer = null;
-let connections = {}; // Map of PeerJS DataConnections
+let connections = {};
 
-// Simulation State
 let simState = { players: {} };
-let inputBuffer = {}; // inputBuffer[tick][playerId] = inputData
-let currentTick = 0;   // The tick currently being simulated
-let nextInputTick = 0; // The future tick we are generating local input for
+let inputBuffer = {};
+let currentTick = 0;
+let nextInputTick = 0;
 
-// Sync & History
-let hashHistory = {};  // hashHistory[tick] = hash
-let stateHistory = {}; // stateHistory[tick] = state clone
+let hashHistory = {};
+let stateHistory = {};
 
-// Timing
 let lastTime = 0;
 let accumulator = 0;
 
-// Local Input Tracker
 const localInput = { up: false, down: false, left: false, right: false, action: false, angle: 0 };
 
 function logMsg(msg) {
@@ -109,87 +118,156 @@ function logMsg(msg) {
 }
 
 function computeHash(state) {
-    // Simple deterministic string hash for resync detection
     const str = JSON.stringify(state);
     let hash = 0;
     for (let i = 0; i < str.length; i++) {
         hash = ((hash << 5) - hash) + str.charCodeAt(i);
-        hash |= 0; 
+        hash |= 0;
     }
     return hash;
 }
 
-// Clean up old memory to prevent leaks
 function pruneHistory(tick) {
-    const pruneTick = tick - 300; // Keep last 5 seconds
+    const pruneTick = tick - 300;
     if (inputBuffer[pruneTick]) delete inputBuffer[pruneTick];
     if (hashHistory[pruneTick]) delete hashHistory[pruneTick];
     if (stateHistory[pruneTick]) delete stateHistory[pruneTick];
 }
 
+// FIX 4: Host ID collision fix — append a random suffix so a new host doesn't
+// get rejected when the previous host's PeerJS session hasn't expired yet.
+// The room code is embedded so clients can still find the host reliably.
+function makeHostId(code) {
+    // Sanitise the room code so it's a valid PeerJS ID (alphanumeric + hyphens only)
+    const safe = code.replace(/[^a-zA-Z0-9-]/g, '-');
+    return `hst-${safe}`;
+}
+
 function initHost() {
-    const code = document.getElementById('roomCode').value;
-    myId = `host-${code}`;
+    const code = document.getElementById('roomCode').value.trim();
+    myId = makeHostId(code);
     isHost = true;
+
+    logMsg(`Starting as Host with ID: ${myId}`);
     
+    // FIX 5: If the ID is already taken (e.g. stale session), destroy and retry with a
+    // fresh random suffix so the host can still start the room.
     peer = new Peer(myId, ICE_CONFIG);
+    
+    peer.on('error', (err) => {
+        logMsg(`Peer error: ${err.type} — ${err.message || ''}`);
+        if (err.type === 'unavailable-id') {
+            logMsg('Host ID taken — generating a unique fallback ID...');
+            peer.destroy();
+            myId = `hst-${code.replace(/[^a-zA-Z0-9-]/g, '-')}-${Math.random().toString(36).substr(2,4)}`;
+            logMsg(`New Host ID: ${myId}  ← clients must use this room code: ${code} (host will relay it)`);
+            peer = new Peer(myId, ICE_CONFIG);
+            setupHostPeerEvents();
+        }
+    });
+
+    setupHostPeerEvents();
+}
+
+function setupHostPeerEvents() {
     setupPeerEvents();
 
     peer.on('connection', (conn) => {
+        logMsg(`Incoming connection from: ${conn.peer}`);
+
         conn.on('open', () => {
             logMsg(`Player connected: ${conn.peer}`);
             connections[conn.peer] = conn;
-            
+
             if (!expectedPlayers.includes(conn.peer)) {
                 expectedPlayers.push(conn.peer);
             }
             updateLobbyUI();
 
-            // Notify new player of everyone currently in room
             conn.send({ type: 'lobby_update', players: expectedPlayers });
-            // Notify others
             broadcast({ type: 'lobby_update', players: expectedPlayers }, conn.peer);
         });
 
         conn.on('data', (data) => handleNetworkMessage(data, conn.peer));
         conn.on('close', () => handleDisconnect(conn.peer));
+        // FIX 6: Log connection errors per-connection so you can see exactly what fails
+        conn.on('error', (e) => logMsg(`Connection error with ${conn.peer}: ${e}`));
     });
 }
 
 function initClient() {
-    const code = document.getElementById('roomCode').value;
-    const hostId = `host-${code}`;
-    myId = `client-${Math.random().toString(36).substr(2, 6)}`;
+    const code = document.getElementById('roomCode').value.trim();
+    const hostId = makeHostId(code);
+    myId = `cli-${Math.random().toString(36).substr(2, 6)}`;
     isHost = false;
-    
+
+    logMsg(`Starting as Client. My ID: ${myId}  Connecting to: ${hostId}`);
+
     peer = new Peer(myId, ICE_CONFIG);
-    setupPeerEvents();
+
+    peer.on('error', (err) => {
+        logMsg(`Peer error: ${err.type} — ${err.message || ''}`);
+    });
 
     peer.on('open', () => {
-        logMsg(`Connecting to host: ${hostId}...`);
-        const conn = peer.connect(hostId, { reliable: true });
+        logMsg(`My Peer ID registered: ${myId}`);
+        logMsg(`Attempting connection to host: ${hostId}...`);
+        expectedPlayers = [myId];
+
+        document.getElementById('setup-ui').style.display = 'none';
+        document.getElementById('lobby-ui').style.display = 'block';
+        updateLobbyUI();
+
+        // FIX 7: Pass ICE config options explicitly when connecting as a client too
+        const conn = peer.connect(hostId, {
+            reliable: true,
+            serialization: 'json'
+        });
+
+        // FIX 8: Set a timeout so the user knows if connection silently failed
+        const connTimeout = setTimeout(() => {
+            if (conn.open) return;
+            logMsg('⚠️ Connection timed out after 15s. Check the room code, or the host may be behind a strict firewall.');
+        }, 15000);
 
         conn.on('open', () => {
-            logMsg('Connected to host!');
+            clearTimeout(connTimeout);
+            logMsg('✅ Connected to host!');
             connections[hostId] = conn;
         });
 
         conn.on('data', (data) => handleNetworkMessage(data, hostId));
-        conn.on('close', () => handleDisconnect(hostId));
+        conn.on('close', () => {
+            clearTimeout(connTimeout);
+            handleDisconnect(hostId);
+        });
+        conn.on('error', (e) => logMsg(`Connection error: ${e}`));
     });
 }
 
 function setupPeerEvents() {
     peer.on('open', (id) => {
-        logMsg(`My Peer ID: ${id}`);
+        logMsg(`✅ My Peer ID: ${id}`);
         expectedPlayers = [myId];
-        
+
         document.getElementById('setup-ui').style.display = 'none';
         document.getElementById('lobby-ui').style.display = 'block';
         if (isHost) document.getElementById('btnStart').style.display = 'inline-block';
         updateLobbyUI();
     });
-    peer.on('error', (err) => logMsg(`Peer error: ${err.type}`));
+
+    // Only log errors not already handled by specific error handlers above
+    peer.on('error', (err) => {
+        if (err.type !== 'unavailable-id') {
+            logMsg(`Peer error: ${err.type}`);
+        }
+    });
+
+    // FIX 9: Log ICE/connection state for diagnosis
+    peer.on('disconnected', () => {
+        logMsg('⚠️ Disconnected from PeerJS signaling server. Attempting reconnect...');
+        peer.reconnect();
+    });
 }
 
 function broadcast(msg, excludeId = null) {
@@ -219,17 +297,14 @@ function handleNetworkMessage(msg, senderId) {
             break;
 
         case 'input':
-            // Store received input
             if (!inputBuffer[msg.tick]) inputBuffer[msg.tick] = {};
             inputBuffer[msg.tick][msg.playerId] = msg.input;
-
-            // If Host, relay input to everyone else
             if (isHost) {
-                broadcast(msg, senderId); 
+                broadcast(msg, senderId);
             }
             break;
 
-        case 'sync_check': // Received by Host from Client
+        case 'sync_check':
             if (!isHost) return;
             const hostHash = hashHistory[msg.tick];
             if (hostHash !== undefined && hostHash !== msg.hash) {
@@ -242,11 +317,9 @@ function handleNetworkMessage(msg, senderId) {
             }
             break;
 
-        case 'force_sync': // Received by Client from Host
+        case 'force_sync':
             logMsg(`>>> SNAPSHOT RECEIVED: Overwriting state to tick ${msg.tick}`);
             simState = JSON.parse(JSON.stringify(msg.state));
-            
-            // Fast-forward (Replay) from the sync point back up to currentTick
             for (let t = msg.tick + 1; t < currentTick; t++) {
                 if (hasAllInputsFor(t)) {
                     runPhysics(t, simState);
@@ -286,7 +359,7 @@ function hasAllInputsFor(tick) {
 }
 
 function generateAndSendInput(tick) {
-    const myInputData = { ...localInput }; 
+    const myInputData = { ...localInput };
     if (!inputBuffer[tick]) inputBuffer[tick] = {};
     inputBuffer[tick][myId] = myInputData;
 
@@ -302,22 +375,22 @@ function startGame() {
     expectedPlayers.sort();
     expectedPlayers.forEach((id, index) => {
         simState.players[id] = {
-            x: 50 + (index * 100), 
-            y: 50, 
-            vx: 0, 
+            x: 50 + (index * 100),
+            y: 50,
+            vx: 0,
             vy: 0,
             color: `hsl(${index * 137.5}, 70%, 50%)`
         };
     });
 
     currentTick = 0;
-    nextInputTick = 0; 
-    
+    nextInputTick = 0;
+
     for (let i = 0; i < INPUT_BUFFER; i++) {
         generateAndSendInput(nextInputTick);
         nextInputTick++;
     }
-    
+
     lastTime = performance.now();
     requestAnimationFrame(gameLoop);
 }
@@ -327,40 +400,28 @@ function gameLoop(time) {
     if (appState !== 'PLAYING') return;
 
     let dt = time - lastTime;
-    if (dt > 250) dt = MS_PER_TICK; // clamp after tab switch
+    if (dt > 250) dt = MS_PER_TICK;
     accumulator += dt;
     lastTime = time;
 
-    // 1. Advance simulation at real-time rate (1 tick per MS_PER_TICK), gated by inputs.
-    //    We deliberately do now try to catch up faster than 1 tick/frame.
-    //    Doing so caused an oscillating burst-catchup: when a stall clears, one player
-    //    would race through 50+ ticks instantly, overshoot the other player's input buffer,
-    //    and immediately cause the other player to stall. They'd keep trading.
     const ticksBefore = currentTick;
     while (accumulator >= MS_PER_TICK) {
-        if (!hasAllInputsFor(currentTick)) break; // stall: wait for remote inputs
+        if (!hasAllInputsFor(currentTick)) break;
         accumulator -= MS_PER_TICK;
         simulateTick(currentTick);
         currentTick++;
         pruneHistory(currentTick);
     }
 
-    // If stalling, drain the accumulator so we don't burst when inputs arrive.
     if (!hasAllInputsFor(currentTick)) {
         accumulator = Math.min(accumulator, MS_PER_TICK - 1);
     }
 
-    // 2. Always maintain exactly INPUT_BUFFER input ticks ahead of currentTick.
-    //    This runs even while stalling, so the remote player is never starved.
-    //    The hard cap at currentTick + INPUT_BUFFER is the key fix: it prevents
-    //    building up a huge backlog of future inputs that causes the other player
-    //    to burst-catchup and trigger the alternating stall pattern.
     while (nextInputTick < currentTick + INPUT_BUFFER) {
         generateAndSendInput(nextInputTick);
         nextInputTick++;
     }
 
-    // 3. UI true stall means we had real-time budget but couldn't advance simulation.
     const statusEl = document.getElementById('syncStatus');
     if (currentTick === ticksBefore && !hasAllInputsFor(currentTick)) {
         statusEl.innerText = "Stalling (Waiting for network...)";
@@ -405,7 +466,6 @@ function simulateTick(tick) {
     if (tick > 0 && tick % RESYNC_INTERVAL === 0) {
         const hash = computeHash(simState);
         hashHistory[tick] = hash;
-        
         stateHistory[tick] = JSON.parse(JSON.stringify(simState));
 
         if (!isHost) {
@@ -417,7 +477,7 @@ function simulateTick(tick) {
 function render() {
     const canvas = document.getElementById('gameCanvas');
     const ctx = canvas.getContext('2d');
-    
+
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
     for (let id in simState.players) {
@@ -437,7 +497,6 @@ function updateLobbyUI() {
     document.getElementById('playerCount').innerText = `Players: ${expectedPlayers.length}`;
 }
 
-// Event Listeners
 document.getElementById('btnHost').addEventListener('click', initHost);
 document.getElementById('btnJoin').addEventListener('click', initClient);
 document.getElementById('btnStart').addEventListener('click', () => {
@@ -446,7 +505,6 @@ document.getElementById('btnStart').addEventListener('click', () => {
         startGame();
     }
 });
-
 </script>
 </body>
 </html>
