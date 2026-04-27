@@ -167,14 +167,71 @@ function initHost() {
     setupHostPeerEvents();
 }
 
+// P2P ENFORCEMENT: Check if the selected ICE candidate is relay (TURN).
+// If it is, close the connection — the game must run over direct P2P only.
+async function enforceP2P(conn) {
+    // Give ICE a moment to finish selecting a candidate pair
+    await new Promise(res => setTimeout(res, 2000));
+    if (!conn.open) return false;
+
+    try {
+        const stats = await conn.peerConnection.getStats();
+        let selectedPair = null;
+
+        stats.forEach(report => {
+            if (report.type === 'candidate-pair' && report.nominated && report.state === 'succeeded') {
+                selectedPair = report;
+            }
+        });
+
+        // Fallback: some browsers use 'in-progress' or just 'nominated' without 'succeeded'
+        if (!selectedPair) {
+            stats.forEach(report => {
+                if (report.type === 'candidate-pair' && report.nominated) {
+                    selectedPair = report;
+                }
+            });
+        }
+
+        if (!selectedPair) {
+            logMsg(`Could not determine ICE candidate type for ${conn.peer} — allowing connection.`);
+            return true;
+        }
+
+        let localCandidate = null, remoteCandidate = null;
+        stats.forEach(report => {
+            if (report.id === selectedPair.localCandidateId) localCandidate = report;
+            if (report.id === selectedPair.remoteCandidateId) remoteCandidate = report;
+        });
+
+        const localType = localCandidate?.candidateType || 'unknown';
+        const remoteType = remoteCandidate?.candidateType || 'unknown';
+
+        if (localType === 'relay' || remoteType === 'relay') {
+            logMsg(`TURN relay detected for ${conn.peer} (local: ${localType}, remote: ${remoteType}) — closing. Direct P2P required!`);
+            conn.close();
+            return false;
+        } else {
+            logMsg(`P2P confirmed for ${conn.peer} (local: ${localType}, remote: ${remoteType})`);
+            return true;
+        }
+    } catch(e) {
+        logMsg(`Could not verify ICE type for ${conn.peer}: ${e} — allowing connection.`);
+        return true;
+    }
+}
+
 function setupHostPeerEvents() {
     setupPeerEvents();
 
     peer.on('connection', (conn) => {
         logMsg(`Incoming connection from: ${conn.peer}`);
 
-        conn.on('open', () => {
-            logMsg(`Player connected: ${conn.peer}`);
+        conn.on('open', async () => {
+            logMsg(`Player connected: ${conn.peer} — verifying P2P...`);
+            const isP2P = await enforceP2P(conn);
+            if (!isP2P) return; // Connection was closed — relay not allowed
+
             connections[conn.peer] = conn;
 
             if (!expectedPlayers.includes(conn.peer)) {
@@ -228,9 +285,12 @@ function initClient() {
             logMsg('Connection timed out after 15s. Check the room code, or the host may be behind a strict firewall.');
         }, 15000);
 
-        conn.on('open', () => {
+        conn.on('open', async () => {
             clearTimeout(connTimeout);
-            logMsg('Connected to host!');
+            logMsg('Connected to host! Verifying P2P...');
+            const isP2P = await enforceP2P(conn);
+            if (!isP2P) return; // Connection was closed — relay not allowed
+
             connections[hostId] = conn;
         });
 
