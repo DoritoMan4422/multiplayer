@@ -227,12 +227,12 @@ function initClient() {
         // FIX 8: Set a timeout so the user knows if connection silently failed
         const connTimeout = setTimeout(() => {
             if (conn.open) return;
-            logMsg('⚠️ Connection timed out after 15s. Check the room code, or the host may be behind a strict firewall.');
+            logMsg('Connection timed out after 15s. Check the room code, or the host may be behind a strict firewall.');
         }, 15000);
 
         conn.on('open', () => {
             clearTimeout(connTimeout);
-            logMsg('✅ Connected to host!');
+            logMsg('Connected to host!');
             connections[hostId] = conn;
         });
 
@@ -247,7 +247,7 @@ function initClient() {
 
 function setupPeerEvents() {
     peer.on('open', (id) => {
-        logMsg(`✅ My Peer ID: ${id}`);
+        logMsg(`My Peer ID: ${id}`);
         expectedPlayers = [myId];
 
         document.getElementById('setup-ui').style.display = 'none';
@@ -265,7 +265,7 @@ function setupPeerEvents() {
 
     // FIX 9: Log ICE/connection state for diagnosis
     peer.on('disconnected', () => {
-        logMsg('⚠️ Disconnected from PeerJS signaling server. Attempting reconnect...');
+        logMsg('Disconnected from PeerJS signaling server. Attempting reconnect...');
         peer.reconnect();
     });
 }
